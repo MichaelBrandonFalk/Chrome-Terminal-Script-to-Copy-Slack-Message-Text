@@ -1,0 +1,299 @@
+(() => {
+  // =========================
+  // Slack channel text dumper
+  // =========================
+  // Usage:
+  //   1) Paste into DevTools Console while viewing a Slack channel
+  //   2) To stop early: slackDump.stop()
+  //   3) To download again: slackDump.download()
+  // Notes:
+  //   - Captures username + text only (no images/GIFs)
+  //   - Must be able to "see" messages in the UI; this does not bypass permissions
+  //   - Slack virtualizes DOM; this script accumulates as it scrolls
+
+  const CONFIG = {
+    runMs: 5 * 60 * 1000,      // 5 minutes
+    stepWaitMs: 900,           // wait after each scroll for Slack to load
+    scrollPx: 1400,            // scroll amount per step
+    logEvery: 1,               // log every N steps
+    filePrefix: "slack_channel_dump",
+  };
+
+  const STATE = {
+    stopRequested: false,
+    startedAt: Date.now(),
+    steps: 0,
+    // Use Map to dedupe while preserving first-seen order
+    // key -> { user, text, tsHint }
+    records: new Map(),
+  };
+
+  // Expose controls
+  window.slackDump = {
+    stop: () => {
+      STATE.stopRequested = true;
+      console.log("Stop requested. Will finalize and download shortly.");
+    },
+    status: () => ({
+      runningForSeconds: Math.round((Date.now() - STATE.startedAt) / 1000),
+      steps: STATE.steps,
+      saved: STATE.records.size,
+      stopRequested: STATE.stopRequested,
+    }),
+    download: () => finalizeAndDownload(),
+    reset: () => {
+      STATE.stopRequested = false;
+      STATE.startedAt = Date.now();
+      STATE.steps = 0;
+      STATE.records.clear();
+      console.log("State reset. Re-run the script to start again.");
+    },
+  };
+
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function sanitizeFilePart(s) {
+    return (s || "")
+      .replace(/[^\w\-]+/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 60);
+  }
+
+  function guessChannelName() {
+    // Best-effort: Slack titles often include channel name in document.title
+    // Example patterns vary, so keep it simple.
+    const t = document.title || "";
+    return sanitizeFilePart(t);
+  }
+
+  function pickFirstText(root, selectors) {
+    for (const sel of selectors) {
+      const el = root.querySelector(sel);
+      const txt = (el && (el.textContent || el.innerText || "") || "").trim();
+      if (txt) return txt;
+    }
+    return "";
+  }
+
+  function findMessageScroller() {
+    // Slack commonly uses data-qa="slack_kit_scrollbar" for scroll panels.
+    // There are usually multiple; we pick the one that contains messages. :contentReference[oaicite:2]{index=2}
+    const candidates = Array.from(document.querySelectorAll('[data-qa="slack_kit_scrollbar"]'));
+
+    // Score: prefer scrollers that contain many message containers
+    let best = null;
+    let bestScore = -1;
+
+    for (const el of candidates) {
+      const count = el.querySelectorAll?.('[data-qa="message_container"]').length || 0;
+      const scrollable = el.scrollHeight > el.clientHeight + 5;
+      const score = (scrollable ? 1000 : 0) + count;
+      if (score > bestScore) {
+        best = el;
+        bestScore = score;
+      }
+    }
+
+    if (best) return best;
+
+    // Fallback: any scrollable element that contains messages
+    const allDivs = Array.from(document.querySelectorAll("div"));
+    best = null;
+    bestScore = -1;
+
+    for (const el of allDivs) {
+      const scrollable = el.scrollHeight > el.clientHeight + 50;
+      if (!scrollable) continue;
+      const count = el.querySelectorAll?.('[data-qa="message_container"]').length || 0;
+      if (count === 0) continue;
+      const score = count;
+      if (score > bestScore) {
+        best = el;
+        bestScore = score;
+      }
+    }
+
+    return best;
+  }
+
+  function getUsernameForMessage(msgEl) {
+    // Slack often omits repeated sender name for consecutive messages.
+    // We first try within the container; if missing, walk upward in the DOM.
+    const senderSelectors = [
+      '[data-qa="message_sender"]',
+      'a.c-message__sender_link',
+      '.c-message__sender',
+      '.c-message_kit__sender',
+    ];
+
+    let cur = msgEl;
+    for (let hops = 0; hops < 10 && cur; hops++) {
+      const name = pickFirstText(cur, senderSelectors);
+      if (name) return name;
+      // Try previous sibling message container first, then parent
+      const prev = cur.previousElementSibling;
+      if (prev && prev.querySelector?.('[data-qa="message_sender"], a.c-message__sender_link, .c-message__sender, .c-message_kit__sender')) {
+        cur = prev;
+        continue;
+      }
+      cur = cur.parentElement;
+    }
+
+    return "Unknown";
+  }
+
+  function getTextForMessage(msgEl) {
+    // Prefer Slack's message text nodes
+    const nodes = Array.from(msgEl.querySelectorAll('[data-qa="message-text"]'));
+
+    // Fallbacks (Slack UI variants)
+    const fallback = nodes.length
+      ? []
+      : Array.from(msgEl.querySelectorAll('.c-message_kit__text, .c-message__body'));
+
+    const useNodes = nodes.length ? nodes : fallback;
+
+    const parts = useNodes
+      .map((n) => (n.innerText || "").trim())
+      .filter(Boolean);
+
+    // Remove obvious UI-only lines if they appear in innerText
+    const text = parts.join("\n").trim();
+    return text;
+  }
+
+  function getTsHint(msgEl) {
+    // Optional, used only for sorting if present; not output
+    // Try common attributes, then any datetime on a timestamp element
+    const attrCandidates = ["data-ts", "data-message-ts", "data-item-key", "data-message-id"];
+    for (const a of attrCandidates) {
+      const v = msgEl.getAttribute?.(a);
+      if (v) return v;
+    }
+    const timeEl =
+      msgEl.querySelector?.('time[datetime]') ||
+      msgEl.querySelector?.('[data-qa="message_timestamp"] time[datetime]') ||
+      msgEl.querySelector?.('[data-qa="message_timestamp"]');
+    const dt = timeEl?.getAttribute?.("datetime") || "";
+    return dt.trim();
+  }
+
+  function stableKey(user, text, tsHint) {
+    // Prefer tsHint if present, otherwise hash-like key from content
+    if (tsHint) return `TS:${tsHint}`;
+    // Content-based key (may merge identical repeated messages)
+    return `U:${user}|T:${text}`;
+  }
+
+  function captureVisibleMessages() {
+    const containers = Array.from(document.querySelectorAll('[data-qa="message_container"]'));
+    let added = 0;
+
+    for (const msg of containers) {
+      const text = getTextForMessage(msg);
+      if (!text) continue;
+
+      const user = getUsernameForMessage(msg);
+      const tsHint = getTsHint(msg);
+      const key = stableKey(user, text, tsHint);
+
+      if (!STATE.records.has(key)) {
+        STATE.records.set(key, { user, text, tsHint });
+        added++;
+      }
+    }
+
+    return { visible: containers.length, added };
+  }
+
+  function scrollUp(scroller) {
+    const before = scroller.scrollTop;
+    scroller.scrollTop = Math.max(0, before - CONFIG.scrollPx);
+    return { before, after: scroller.scrollTop };
+  }
+
+  function finalizeAndDownload() {
+    // Best-effort ordering: if enough ts hints exist, sort by tsHint
+    const rows = Array.from(STATE.records.values());
+
+    const haveTs = rows.filter((r) => r.tsHint).length;
+    if (haveTs > Math.floor(rows.length * 0.5)) {
+      rows.sort((a, b) => (a.tsHint || "").localeCompare(b.tsHint || ""));
+    } else {
+      // Otherwise keep insertion order
+    }
+
+    const output = rows.map((r) => `${r.user}: ${r.text}`).join("\n\n");
+
+    // Attempt clipboard copy (may fail if huge)
+    try {
+      copy(output);
+      console.log(`Copied ${rows.length} messages to clipboard.`);
+    } catch {
+      console.log("Clipboard copy did not succeed (possibly too large). Downloading file.");
+    }
+
+    const channelPart = guessChannelName();
+    const fileName = [
+      CONFIG.filePrefix,
+      channelPart || "channel",
+      new Date().toISOString().slice(0, 10),
+    ].join("_") + ".txt";
+
+    const blob = new Blob([output], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    console.log(`Downloaded ${fileName}`);
+    console.log(`Saved messages: ${rows.length}`);
+  }
+
+  (async () => {
+    console.log("Slack dump started.");
+    console.log("To stop early and download: slackDump.stop()");
+    console.log("To check progress: slackDump.status()");
+
+    const scroller = findMessageScroller();
+    if (!scroller) {
+      console.log("Could not find the message scroller.");
+      console.log("Tip: click inside the message list once, then run the script again.");
+      return;
+    }
+
+    console.log("Scroller found:", scroller);
+
+    const endAt = Date.now() + CONFIG.runMs;
+
+    while (!STATE.stopRequested && Date.now() < endAt) {
+      const { visible, added } = captureVisibleMessages();
+
+      const { before, after } = scrollUp(scroller);
+      STATE.steps++;
+
+      if (STATE.steps % CONFIG.logEvery === 0) {
+        console.log(
+          `Step ${STATE.steps} | visible=${visible} | added=${added} | saved=${STATE.records.size} | scrollTop ${before} -> ${after}`
+        );
+      }
+
+      // If we are at the very top and not moving, stop
+      if (before === 0 && after === 0) {
+        console.log("Reached the top of currently loadable history in the UI.");
+        break;
+      }
+
+      await wait(CONFIG.stepWaitMs);
+    }
+
+    // One last capture, then download
+    captureVisibleMessages();
+    finalizeAndDownload();
+  })();
+})();
