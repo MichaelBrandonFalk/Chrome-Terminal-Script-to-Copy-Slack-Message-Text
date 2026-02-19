@@ -1,6 +1,12 @@
 # Chrome-Terminal-Script-to-Copy-Slack-Message-Text
 If you are looking at Slack in Chrome and open up developer tools, you can go to the terminal part of developer tools and paste this. It will scroll up and copy text for 5 minutes, or for this week, or for messages from today, then download to your computer.
 
+After you have your word doc, I reccomend taking it to Claude and prompting something like 
+"can you create clean old school rap lyrics for a 4 minute song based on interactions in this slack channel. IT should be clean , no offensive words, you can use direct quotes, I want to make sure the characters come through and their "voice"/ tone/ perspective is not lost ."
+
+Then take those lyrics and make a song :) 
+
+
 
 Slack Channel Text Export (Chrome DevTools Method)
 
