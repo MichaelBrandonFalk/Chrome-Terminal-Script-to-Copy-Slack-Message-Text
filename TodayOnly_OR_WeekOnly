@@ -146,4 +146,166 @@
     if (!label) return null;
 
     const lower = label.toLowerCase();
-    const parts = low
+    const parts = lower.split(" at ");
+    if (parts.length < 2) return null;
+
+    const dayPartRaw = parts[0].trim();
+    const timePartRaw = parts.slice(1).join(" at ").trim().toUpperCase();
+
+    const tm = parseTimeTo24h(timePartRaw);
+    if (!tm) return null;
+
+    const now = new Date();
+    let base = new Date(now);
+    base.setHours(0, 0, 0, 0);
+
+    if (dayPartRaw === "today") {
+      // base is today
+    } else if (dayPartRaw === "yesterday") {
+      base.setDate(base.getDate() - 1);
+    } else {
+      const w = weekdayIndex(dayPartRaw);
+      if (w === null) return null;
+
+      // Map weekday label to the most recent occurrence in the current week window.
+      // If it says "Monday" and today is Thursday, we use this week's Monday.
+      // If today is Monday and label says "Sunday", that likely refers to yesterday, so we go back 1 day.
+      const todayW = base.getDay();
+      let delta = todayW - w;
+      if (delta < 0) delta += 7;
+      base.setDate(base.getDate() - delta);
+    }
+
+    base.setHours(tm.hh, tm.mm, 0, 0);
+    return base.getTime();
+  };
+
+  const inScope = (tsMs) => {
+    if (tsMs == null) return false;
+    const nowMs = Date.now();
+
+    if (MODE === "today") {
+      const start = startOfToday().getTime();
+      return tsMs >= start && tsMs <= nowMs;
+    }
+
+    const start = startOfWeekMonday().getTime();
+    return tsMs >= start && tsMs <= nowMs;
+  };
+
+  const captureVisible = () => {
+    const msgs = Array.from(document.querySelectorAll('[data-qa="message_container"]'));
+
+    let lastUser = "";
+    let added = 0;
+
+    for (const msg of msgs) {
+      if (signal.aborted) break;
+
+      const tsLabel = getTimestampLabel(msg);
+      const tsMs = parseSlackAriaLabelToMs(tsLabel);
+      if (!inScope(tsMs)) continue;
+
+      const user = getUsername(msg, lastUser);
+      if (user && user !== "Unknown") lastUser = user;
+
+      const text = extractText(msg);
+      if (!text) continue;
+
+      const idHint =
+        msg.getAttribute("data-message-id") ||
+        msg.getAttribute("data-item-key") ||
+        msg.id ||
+        "";
+
+      // Key uses tsLabel too to reduce collisions when idHint is missing
+      const key = idHint ? `ID:${idHint}` : `K:${tsLabel}|${user}|${text}`;
+
+      if (!STATE.records.has(key)) {
+        STATE.seq += 1;
+        STATE.records.set(key, { tsMs, seq: STATE.seq, user, text });
+        added++;
+      }
+    }
+
+    return { added, total: STATE.records.size, visible: msgs.length };
+  };
+
+  const buildOrderedOutput = () => {
+    const rows = Array.from(STATE.records.values())
+      .filter((r) => typeof r.tsMs === "number")
+      .sort((a, b) => (a.tsMs - b.tsMs) || (a.seq - b.seq));
+
+    return rows.map((r) => `${r.user}: ${r.text}`).join("\n\n");
+  };
+
+  const downloadNow = () => {
+    const output = buildOrderedOutput();
+
+    try { copy(output); } catch {}
+
+    const name = `${CONFIG.filePrefix}_${new Date().toISOString().slice(0, 10)}.txt`;
+    const blob = new Blob([output], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    console.log(`Downloaded ${name}. Saved messages: ${STATE.records.size}`);
+  };
+
+  const stopAndDownload = () => {
+    if (!STATE.running) return;
+    STATE.running = false;
+    controller.abort();
+    setTimeout(() => {
+      try { captureVisible(); } catch {}
+      downloadNow();
+      console.log("Stopped.");
+    }, 0);
+  };
+
+  window.__slackDumpCtl = { running: true, stop: stopAndDownload };
+  window.slackDumpStop = stopAndDownload;
+
+  console.log(`Slack dump started: ${MODE.toUpperCase()} with ordered output.`);
+  console.log("Stop early and download: slackDumpStop()");
+
+  (async () => {
+    const scroller = findScroller();
+    if (!scroller) {
+      console.log("Could not find message scroller. Click inside the message list and run again.");
+      return;
+    }
+
+    const endAt = Date.now() + CONFIG.runMs;
+
+    while (!signal.aborted && Date.now() < endAt) {
+      const before = scroller.scrollTop;
+
+      const { added, total, visible } = captureVisible();
+      STATE.steps++;
+
+      if (added === 0) STATE.noNewAddsStreak++;
+      else STATE.noNewAddsStreak = 0;
+
+      if (typeof scroller.scrollBy === "function") scroller.scrollBy(0, -CONFIG.scrollPx);
+      else scroller.scrollTop = Math.max(0, before - CONFIG.scrollPx);
+
+      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+      const after = scroller.scrollTop;
+
+      console.log(`Step ${STATE.steps} | visible=${visible} | added=${added} | saved=${total} | scrollTop ${before} -> ${after}`);
+
+      if ((before === 0 && after === 0) || STATE.noNewAddsStreak >= CONFIG.stopAfterNoNewAdds) break;
+
+      await sleep(CONFIG.stepWaitMs);
+    }
+
+    if (!signal.aborted) stopAndDownload();
+  })();
+})();
