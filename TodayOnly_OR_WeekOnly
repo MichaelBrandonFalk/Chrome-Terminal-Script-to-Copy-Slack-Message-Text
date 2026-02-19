@@ -1,0 +1,149 @@
+(() => {
+  // Set to "today" or "week"
+  const MODE = "today";
+
+  // Stop any prior run
+  if (window.__slackDumpCtl && window.__slackDumpCtl.running) {
+    try { window.__slackDumpCtl.stop(); } catch {}
+  }
+
+  const CONFIG = {
+    runMs: MODE === "today" ? 6 * 60 * 1000 : 7 * 60 * 1000,
+    stepWaitMs: 850,
+    scrollPx: 1400,
+    filePrefix: MODE === "today" ? "slack_today_ordered" : "slack_this_week_ordered",
+    stopAfterNoNewAdds: MODE === "today" ? 10 : 14,
+  };
+
+  const STATE = {
+    running: true,
+    steps: 0,
+    noNewAddsStreak: 0,
+    seq: 0,
+    // key -> { tsMs, seq, user, text }
+    records: new Map(),
+  };
+
+  const controller = new AbortController();
+  const { signal } = controller;
+
+  const sleep = (ms) =>
+    Promise.race([
+      new Promise((r) => setTimeout(r, ms)),
+      new Promise((r) => signal.addEventListener("abort", r, { once: true })),
+    ]);
+
+  const sanitize = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+  const pickFirstText = (root, selectors) => {
+    for (const sel of selectors) {
+      const el = root.querySelector(sel);
+      const txt = sanitize(el && (el.textContent || el.innerText));
+      if (txt) return txt;
+    }
+    return "";
+  };
+
+  const findScroller = () => {
+    const candidates = Array.from(document.querySelectorAll('[data-qa="slack_kit_scrollbar"]'));
+    let best = null;
+    let bestScore = -1;
+
+    for (const el of candidates) {
+      const count = el.querySelectorAll?.('[data-qa="message_container"]').length || 0;
+      const scrollable = el.scrollHeight > el.clientHeight + 5;
+      const score = (scrollable ? 1000 : 0) + count;
+      if (score > bestScore) { best = el; bestScore = score; }
+    }
+    if (best) return best;
+
+    const divs = Array.from(document.querySelectorAll("div"));
+    best = null;
+    bestScore = -1;
+    for (const el of divs) {
+      if (el.scrollHeight <= el.clientHeight + 50) continue;
+      const count = el.querySelectorAll?.('[data-qa="message_container"]').length || 0;
+      if (!count) continue;
+      if (count > bestScore) { best = el; bestScore = count; }
+    }
+    return best;
+  };
+
+  const extractText = (msg) => {
+    let nodes = Array.from(msg.querySelectorAll('[data-qa="message-text"]'));
+    if (!nodes.length) nodes = Array.from(msg.querySelectorAll(".c-message_kit__text, .c-message__body"));
+    const parts = nodes.map((n) => (n.innerText || "").trim()).filter(Boolean);
+    return parts.join("\n").trim();
+  };
+
+  const getUsername = (msg, lastUser) => {
+    const user =
+      pickFirstText(msg, [
+        '[data-qa="message_sender"]',
+        "a.c-message__sender_link",
+        ".c-message__sender",
+        ".c-message_kit__sender",
+      ]) || lastUser || "Unknown";
+    return user;
+  };
+
+  const getTimestampLabel = (msg) => {
+    const tsEl =
+      msg.querySelector('a.c-timestamp[aria-label]') ||
+      msg.querySelector('[data-qa="message_timestamp"][aria-label]') ||
+      msg.querySelector('a[aria-label*=" at "]') ||
+      msg.querySelector('[aria-label*=" at "]');
+
+    return sanitize(tsEl && tsEl.getAttribute("aria-label"));
+  };
+
+  const weekdayIndex = (name) => {
+    const n = name.toLowerCase().replace(",", "");
+    const map = {
+      sunday: 0, monday: 1, tuesday: 2, wednesday: 3,
+      thursday: 4, friday: 5, saturday: 6
+    };
+    return Object.prototype.hasOwnProperty.call(map, n) ? map[n] : null;
+  };
+
+  const parseTimeTo24h = (timeStr) => {
+    // Accepts "9:41 AM" or "9 AM"
+    const m = timeStr.match(/^(\d{1,2})(?::(\d{2}))?\s*([AP]M)$/i);
+    if (!m) return null;
+
+    let hh = parseInt(m[1], 10);
+    const mm = m[2] ? parseInt(m[2], 10) : 0;
+    const ap = m[3].toUpperCase();
+
+    if (ap === "AM") {
+      if (hh === 12) hh = 0;
+    } else {
+      if (hh !== 12) hh += 12;
+    }
+    return { hh, mm };
+  };
+
+  const startOfToday = () => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  };
+
+  const startOfWeekMonday = () => {
+    const d = new Date();
+    const day = d.getDay(); // 0 Sun..6 Sat
+    const offset = (day + 6) % 7; // monday-based
+    d.setDate(d.getDate() - offset);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  };
+
+  const parseSlackAriaLabelToMs = (label) => {
+    // Expected like:
+    // "Today at 9:41 AM"
+    // "Yesterday at 3:12 PM"
+    // "Monday at 10:05 AM"
+    if (!label) return null;
+
+    const lower = label.toLowerCase();
+    const parts = low
