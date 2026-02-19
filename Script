@@ -1,87 +1,60 @@
 (() => {
-  // =========================
-  // Slack channel text dumper
-  // =========================
-  // Usage:
-  //   1) Paste into DevTools Console while viewing a Slack channel
-  //   2) To stop early: slackDump.stop()
-  //   3) To download again: slackDump.download()
-  // Notes:
-  //   - Captures username + text only (no images/GIFs)
-  //   - Must be able to "see" messages in the UI; this does not bypass permissions
-  //   - Slack virtualizes DOM; this script accumulates as it scrolls
+  // If an old run is active, stop it first.
+  if (window.slackDump && window.slackDump.running) {
+    console.log("Found an existing slackDump run. Stopping it now...");
+    window.slackDump.stop();
+  }
 
   const CONFIG = {
-    runMs: 5 * 60 * 1000,      // 5 minutes
-    stepWaitMs: 900,           // wait after each scroll for Slack to load
-    scrollPx: 1400,            // scroll amount per step
-    logEvery: 1,               // log every N steps
-    filePrefix: "slack_channel_dump",
+    runMs: 5 * 60 * 1000,   // auto-stop after 5 minutes
+    stepWaitMs: 800,        // wait for Slack to load messages after scroll
+    scrollPx: 1400,         // how far to scroll each step
+    filePrefix: "slack_channel_user_text",
   };
 
   const STATE = {
+    running: true,
     stopRequested: false,
     startedAt: Date.now(),
     steps: 0,
-    // Use Map to dedupe while preserving first-seen order
-    // key -> { user, text, tsHint }
+    saved: 0,
+    lastProgressLogAt: 0,
+  };
+
+  // Preserve native window.stop (browser stop-loading) so you can restore it later.
+  const nativeWindowStop = window.stop && window.stop.bind(window);
+  window.__nativeWindowStop = nativeWindowStop;
+
+  // Abort controller for immediate stops (no waiting a whole sleep).
+  const controller = new AbortController();
+  const { signal } = controller;
+
+  const sleep = (ms) =>
+    Promise.race([
+      new Promise((r) => setTimeout(r, ms)),
+      new Promise((r) => signal.addEventListener("abort", r, { once: true })),
+    ]);
+
+  // Data stores (persist across runs if you want)
+  const STORE = window.__slackDumpStore || {
+    // key -> { user, text }
     records: new Map(),
   };
+  window.__slackDumpStore = STORE;
 
-  // Expose controls
-  window.slackDump = {
-    stop: () => {
-      STATE.stopRequested = true;
-      console.log("Stop requested. Will finalize and download shortly.");
-    },
-    status: () => ({
-      runningForSeconds: Math.round((Date.now() - STATE.startedAt) / 1000),
-      steps: STATE.steps,
-      saved: STATE.records.size,
-      stopRequested: STATE.stopRequested,
-    }),
-    download: () => finalizeAndDownload(),
-    reset: () => {
-      STATE.stopRequested = false;
-      STATE.startedAt = Date.now();
-      STATE.steps = 0;
-      STATE.records.clear();
-      console.log("State reset. Re-run the script to start again.");
-    },
-  };
-
-  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  function sanitizeFilePart(s) {
-    return (s || "")
-      .replace(/[^\w\-]+/g, "_")
-      .replace(/_+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .slice(0, 60);
+  function sanitize(s) {
+    return (s || "").replace(/\s+/g, " ").trim();
   }
 
-  function guessChannelName() {
-    // Best-effort: Slack titles often include channel name in document.title
-    // Example patterns vary, so keep it simple.
-    const t = document.title || "";
-    return sanitizeFilePart(t);
+  function guessFileName() {
+    const t = sanitize(document.title);
+    const safe = t.replace(/[^\w\-]+/g, "_").replace(/_+/g, "_").slice(0, 80) || "channel";
+    return `${CONFIG.filePrefix}_${safe}_${new Date().toISOString().slice(0, 10)}.txt`;
   }
 
-  function pickFirstText(root, selectors) {
-    for (const sel of selectors) {
-      const el = root.querySelector(sel);
-      const txt = (el && (el.textContent || el.innerText || "") || "").trim();
-      if (txt) return txt;
-    }
-    return "";
-  }
-
-  function findMessageScroller() {
-    // Slack commonly uses data-qa="slack_kit_scrollbar" for scroll panels.
-    // There are usually multiple; we pick the one that contains messages. :contentReference[oaicite:2]{index=2}
+  function findScroller() {
+    // Slack commonly uses these for scroll panes. We pick the one with most message containers.
     const candidates = Array.from(document.querySelectorAll('[data-qa="slack_kit_scrollbar"]'));
-
-    // Score: prefer scrollers that contain many message containers
     let best = null;
     let bestScore = -1;
 
@@ -97,203 +70,217 @@
 
     if (best) return best;
 
-    // Fallback: any scrollable element that contains messages
-    const allDivs = Array.from(document.querySelectorAll("div"));
+    // Fallback: any scrollable element containing messages.
+    const divs = Array.from(document.querySelectorAll("div"));
     best = null;
     bestScore = -1;
 
-    for (const el of allDivs) {
-      const scrollable = el.scrollHeight > el.clientHeight + 50;
-      if (!scrollable) continue;
+    for (const el of divs) {
+      if (el.scrollHeight <= el.clientHeight + 50) continue;
       const count = el.querySelectorAll?.('[data-qa="message_container"]').length || 0;
-      if (count === 0) continue;
-      const score = count;
-      if (score > bestScore) {
+      if (!count) continue;
+      if (count > bestScore) {
         best = el;
-        bestScore = score;
+        bestScore = count;
       }
     }
 
     return best;
   }
 
-  function getUsernameForMessage(msgEl) {
-    // Slack often omits repeated sender name for consecutive messages.
-    // We first try within the container; if missing, walk upward in the DOM.
-    const senderSelectors = [
-      '[data-qa="message_sender"]',
-      'a.c-message__sender_link',
-      '.c-message__sender',
-      '.c-message_kit__sender',
-    ];
-
-    let cur = msgEl;
-    for (let hops = 0; hops < 10 && cur; hops++) {
-      const name = pickFirstText(cur, senderSelectors);
-      if (name) return name;
-      // Try previous sibling message container first, then parent
-      const prev = cur.previousElementSibling;
-      if (prev && prev.querySelector?.('[data-qa="message_sender"], a.c-message__sender_link, .c-message__sender, .c-message_kit__sender')) {
-        cur = prev;
-        continue;
-      }
-      cur = cur.parentElement;
+  function pickFirstText(root, selectors) {
+    for (const sel of selectors) {
+      const el = root.querySelector(sel);
+      const txt = sanitize(el && (el.textContent || el.innerText));
+      if (txt) return txt;
     }
-
-    return "Unknown";
+    return "";
   }
 
-  function getTextForMessage(msgEl) {
-    // Prefer Slack's message text nodes
-    const nodes = Array.from(msgEl.querySelectorAll('[data-qa="message-text"]'));
+  function getMessageIdHint(msg) {
+    // Prefer stable IDs if present.
+    return (
+      msg.getAttribute("data-message-id") ||
+      msg.getAttribute("data-item-key") ||
+      msg.id ||
+      ""
+    );
+  }
 
-    // Fallbacks (Slack UI variants)
-    const fallback = nodes.length
-      ? []
-      : Array.from(msgEl.querySelectorAll('.c-message_kit__text, .c-message__body'));
+  function extractTextFromMessage(msg) {
+    // Primary selector for Slack message text
+    let nodes = Array.from(msg.querySelectorAll('[data-qa="message-text"]'));
 
-    const useNodes = nodes.length ? nodes : fallback;
+    // Fallbacks for UI variations
+    if (!nodes.length) {
+      nodes = Array.from(msg.querySelectorAll(".c-message_kit__text, .c-message__body"));
+    }
 
-    const parts = useNodes
-      .map((n) => (n.innerText || "").trim())
+    const parts = nodes
+      .map((n) => sanitize(n.innerText))
       .filter(Boolean);
 
-    // Remove obvious UI-only lines if they appear in innerText
-    const text = parts.join("\n").trim();
-    return text;
+    return parts.join("\n").trim();
   }
 
-  function getTsHint(msgEl) {
-    // Optional, used only for sorting if present; not output
-    // Try common attributes, then any datetime on a timestamp element
-    const attrCandidates = ["data-ts", "data-message-ts", "data-item-key", "data-message-id"];
-    for (const a of attrCandidates) {
-      const v = msgEl.getAttribute?.(a);
-      if (v) return v;
-    }
-    const timeEl =
-      msgEl.querySelector?.('time[datetime]') ||
-      msgEl.querySelector?.('[data-qa="message_timestamp"] time[datetime]') ||
-      msgEl.querySelector?.('[data-qa="message_timestamp"]');
-    const dt = timeEl?.getAttribute?.("datetime") || "";
-    return dt.trim();
-  }
+  function captureVisible() {
+    const msgs = Array.from(document.querySelectorAll('[data-qa="message_container"]'));
 
-  function stableKey(user, text, tsHint) {
-    // Prefer tsHint if present, otherwise hash-like key from content
-    if (tsHint) return `TS:${tsHint}`;
-    // Content-based key (may merge identical repeated messages)
-    return `U:${user}|T:${text}`;
-  }
+    // Fill down usernames for continuation messages in the current viewport.
+    let lastUser = "";
 
-  function captureVisibleMessages() {
-    const containers = Array.from(document.querySelectorAll('[data-qa="message_container"]'));
     let added = 0;
+    for (const msg of msgs) {
+      if (signal.aborted) break;
 
-    for (const msg of containers) {
-      const text = getTextForMessage(msg);
+      const user =
+        pickFirstText(msg, [
+          '[data-qa="message_sender"]',
+          "a.c-message__sender_link",
+          ".c-message__sender",
+          ".c-message_kit__sender",
+        ]) || lastUser || "Unknown";
+
+      if (user && user !== "Unknown") lastUser = user;
+
+      const text = extractTextFromMessage(msg);
       if (!text) continue;
 
-      const user = getUsernameForMessage(msg);
-      const tsHint = getTsHint(msg);
-      const key = stableKey(user, text, tsHint);
+      const idHint = getMessageIdHint(msg);
+      const key = idHint ? `ID:${idHint}` : `UT:${user}\n${text}`;
 
-      if (!STATE.records.has(key)) {
-        STATE.records.set(key, { user, text, tsHint });
+      if (!STORE.records.has(key)) {
+        STORE.records.set(key, { user, text });
         added++;
       }
     }
 
-    return { visible: containers.length, added };
+    STATE.saved = STORE.records.size;
+    return { visible: msgs.length, added };
   }
 
   function scrollUp(scroller) {
     const before = scroller.scrollTop;
-    scroller.scrollTop = Math.max(0, before - CONFIG.scrollPx);
+
+    // Prefer element scrolling APIs when available.
+    if (typeof scroller.scrollBy === "function") {
+      scroller.scrollBy(0, -CONFIG.scrollPx);
+    } else {
+      scroller.scrollTop = Math.max(0, before - CONFIG.scrollPx);
+    }
+
+    // Nudge Slack listeners (some builds respond better with events)
+    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+
     return { before, after: scroller.scrollTop };
   }
 
-  function finalizeAndDownload() {
-    // Best-effort ordering: if enough ts hints exist, sort by tsHint
-    const rows = Array.from(STATE.records.values());
+  function buildOutput() {
+    // Keep insertion order from Map.
+    const rows = Array.from(STORE.records.values()).map((r) => `${r.user}: ${r.text}`);
+    return rows.join("\n\n");
+  }
 
-    const haveTs = rows.filter((r) => r.tsHint).length;
-    if (haveTs > Math.floor(rows.length * 0.5)) {
-      rows.sort((a, b) => (a.tsHint || "").localeCompare(b.tsHint || ""));
-    } else {
-      // Otherwise keep insertion order
-    }
+  function downloadNow() {
+    const output = buildOutput();
 
-    const output = rows.map((r) => `${r.user}: ${r.text}`).join("\n\n");
-
-    // Attempt clipboard copy (may fail if huge)
     try {
       copy(output);
-      console.log(`Copied ${rows.length} messages to clipboard.`);
-    } catch {
-      console.log("Clipboard copy did not succeed (possibly too large). Downloading file.");
+      console.log(`Copied ${STORE.records.size} messages to clipboard (may truncate if huge).`);
+    } catch (e) {
+      console.log("Clipboard copy failed or too large, downloading file instead.");
     }
-
-    const channelPart = guessChannelName();
-    const fileName = [
-      CONFIG.filePrefix,
-      channelPart || "channel",
-      new Date().toISOString().slice(0, 10),
-    ].join("_") + ".txt";
 
     const blob = new Blob([output], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = fileName;
+    a.download = guessFileName();
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
 
-    console.log(`Downloaded ${fileName}`);
-    console.log(`Saved messages: ${rows.length}`);
+    console.log(`Downloaded. Total saved messages: ${STORE.records.size}`);
   }
 
-  (async () => {
-    console.log("Slack dump started.");
-    console.log("To stop early and download: slackDump.stop()");
-    console.log("To check progress: slackDump.status()");
+  function stopAndDownload() {
+    if (!STATE.running) return;
+    STATE.stopRequested = true;
+    STATE.running = false;
+    controller.abort(); // breaks sleeps immediately
+    // Give the current call stack a moment to unwind, then download.
+    setTimeout(() => {
+      try {
+        captureVisible();
+      } catch {}
+      downloadNow();
+      console.log("Stopped.");
+    }, 0);
+  }
 
-    const scroller = findMessageScroller();
+  // Public controls
+  window.slackDump = {
+    running: true,
+    stop: stopAndDownload,
+    download: downloadNow,
+    status: () => ({
+      running: STATE.running,
+      stopRequested: STATE.stopRequested,
+      seconds: Math.round((Date.now() - STATE.startedAt) / 1000),
+      steps: STATE.steps,
+      saved: STORE.records.size,
+    }),
+    restoreStop: () => {
+      if (nativeWindowStop) window.stop = nativeWindowStop;
+      console.log("Restored native window.stop().");
+    },
+    reset: () => {
+      STORE.records.clear();
+      console.log("Cleared saved messages.");
+    },
+  };
+
+  // Make "stop()" work by overriding window.stop safely.
+  // You can restore via slackDump.restoreStop().
+  window.stop = () => stopAndDownload();
+
+  console.log("slackDump started.");
+  console.log("Type stop() to stop and download.");
+  console.log("Backup controls: slackDump.stop(), slackDump.status(), slackDump.download(), slackDump.restoreStop()");
+  console.log("Tip: click inside the message list first if scrolling does nothing.");
+
+  (async () => {
+    const scroller = findScroller();
     if (!scroller) {
-      console.log("Could not find the message scroller.");
-      console.log("Tip: click inside the message list once, then run the script again.");
+      console.log("Could not find Slack message scroller. Click inside the message list and run again.");
       return;
     }
 
-    console.log("Scroller found:", scroller);
-
     const endAt = Date.now() + CONFIG.runMs;
 
-    while (!STATE.stopRequested && Date.now() < endAt) {
-      const { visible, added } = captureVisibleMessages();
-
+    while (!signal.aborted && Date.now() < endAt) {
+      const { visible, added } = captureVisible();
       const { before, after } = scrollUp(scroller);
+
       STATE.steps++;
 
-      if (STATE.steps % CONFIG.logEvery === 0) {
+      const now = Date.now();
+      if (now - STATE.lastProgressLogAt > 1500) {
         console.log(
-          `Step ${STATE.steps} | visible=${visible} | added=${added} | saved=${STATE.records.size} | scrollTop ${before} -> ${after}`
+          `Step ${STATE.steps} | visible=${visible} | added=${added} | saved=${STORE.records.size} | scrollTop ${before} -> ${after}`
         );
+        STATE.lastProgressLogAt = now;
       }
 
-      // If we are at the very top and not moving, stop
-      if (before === 0 && after === 0) {
-        console.log("Reached the top of currently loadable history in the UI.");
-        break;
-      }
+      // If we hit the top and cannot move, end early.
+      if (before === 0 && after === 0) break;
 
-      await wait(CONFIG.stepWaitMs);
+      await sleep(CONFIG.stepWaitMs);
     }
 
-    // One last capture, then download
-    captureVisibleMessages();
-    finalizeAndDownload();
+    if (!signal.aborted) {
+      stopAndDownload();
+    }
   })();
 })();
