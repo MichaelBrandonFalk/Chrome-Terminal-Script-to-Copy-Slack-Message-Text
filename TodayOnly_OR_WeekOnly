@@ -1,6 +1,6 @@
 (() => {
   // Set to "today" or "week"
-  const MODE = "today";
+  const MODE = "week";
 
   // Stop any prior run
   if (window.__slackDumpCtl && window.__slackDumpCtl.running) {
